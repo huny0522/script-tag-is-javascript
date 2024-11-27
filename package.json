@@ -1,0 +1,59 @@
+{
+  "name": "script-tag-is-javascript",
+  "displayName": "Script Tag Is Javascript",
+  "description": "Recognize JavaScript/TypeScript code inside PHP script tags",
+  "version": "0.0.1",
+  "publisher": "huny0522",
+  "engines": {
+    "vscode": "^1.93.1"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:php"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "script-tag-is-javascript.recognizeScript",
+        "title": "Recognize JavaScript in PHP Script Tags"
+      }
+    ],
+    "grammars": [
+      {
+        "injectTo": ["source.php"],
+        "scopeName": "source.js.embedded.php",
+        "path": "./syntaxes/javascript.tmLanguage.json"
+      }
+    ],
+    "languages": [
+      {
+        "id": "javascript",
+        "extensions": [".js"],
+        "aliases": ["JavaScript", "javascript"],
+        "configuration": "./language-configuration.json"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.93.1",
+    "@types/mocha": "^10.0.9",
+    "@types/node": "20.x",
+    "@typescript-eslint/eslint-plugin": "^8.10.0",
+    "@typescript-eslint/parser": "^8.7.0",
+    "eslint": "^9.13.0",
+    "typescript": "^5.6.3",
+    "@vscode/test-cli": "^0.0.10",
+    "@vscode/test-electron": "^2.4.1"
+  }
+}
