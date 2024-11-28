@@ -20,16 +20,21 @@ async function getFileSymbols(file: vscode.Uri, word: string): Promise<vscode.Lo
 	const content = doc.getText();
 	const symbols: { [key: string]: vscode.Location[] } = {};
 
-	// 변수 선언과 객체 선언을 모두 찾는 정규식
-	const symbolRegex = /(?:const|let|var)?\s*(\w+)\s*=\s*[{]|(\w+)\s*[=:](?:\s*function)?\s*[({]/g;
-	let match;
+	// 변수 선언과 객체 선언을 모두 찾는 정규식 개선
+	const lines = content.split('\n');
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		const symbolRegex = /(?:const|let|var|window\.)?(?:\s*)(\w+)(?:\s*=\s*[{]|\s*[=:](?:\s*function)?\s*[({])/g;
+		let match;
 
-	while ((match = symbolRegex.exec(content)) !== null) {
-		const symbolName = match[1] || match[2];
-		if (!symbols[symbolName]) {
-			symbols[symbolName] = [];
+		while ((match = symbolRegex.exec(line)) !== null) {
+			const symbolName = match[1];
+			if (!symbols[symbolName]) {
+				symbols[symbolName] = [];
+			}
+			const position = new vscode.Position(i, match.index);
+			symbols[symbolName].push(new vscode.Location(file, position));
 		}
-		symbols[symbolName].push(new vscode.Location(file, doc.positionAt(match.index)));
 	}
 
 	fileCache.set(file.fsPath, {
@@ -39,6 +44,24 @@ async function getFileSymbols(file: vscode.Uri, word: string): Promise<vscode.Lo
 	});
 
 	return symbols[word] || [];
+}
+
+async function findDefinitionInFiles(files: vscode.Uri[], word: string): Promise<vscode.Location[]> {
+	const maxConcurrent = 5;
+	const results: vscode.Location[] = [];
+
+	for (let i = 0; i < files.length; i += maxConcurrent) {
+		const batch = files.slice(i, i + maxConcurrent);
+		const batchResults = await Promise.all(batch.map(file => getFileSymbols(file, word)));
+		results.push(...batchResults.flat());
+
+		// 정의를 찾았다면 나머지 파일은 검색하지 않음
+		if (results.length > 0) {
+			break;
+		}
+	}
+
+	return results;
 }
 
 export function activate(context: vscode.ExtensionContext) {
@@ -127,78 +150,42 @@ export function activate(context: vscode.ExtensionContext) {
 
 	context.subscriptions.push(
 		vscode.languages.registerDefinitionProvider(
-			{ scheme: 'file', language: 'php' },
+			[
+				{ scheme: 'file', language: 'php' },
+				{ scheme: 'file', pattern: '**/*.js' },
+				{ scheme: 'file', pattern: '**/*.js.*' }
+			],
 			{
 				async provideDefinition(document: vscode.TextDocument, position: vscode.Position) {
-					if (!isInScriptTag(document, position)) {
+					if (document.languageId === 'php' && !isInScriptTag(document, position)) {
 						return null;
 					}
 
 					const word = document.getText(document.getWordRangeAtPosition(position));
-					const files = await vscode.workspace.findFiles('**/*.js', '**/node_modules/**');
+					if (!word) return null;
 
-					const locations = (await Promise.all(
-						files.map(file => getFileSymbols(file, word))
-					)).flat();
+					// 1. 먼저 현재 열린 문서들에서 검색
+					const openTextDocuments = vscode.workspace.textDocuments
+						.filter(doc => doc.uri.scheme === 'file' &&
+							(doc.languageId === 'javascript' || doc.fileName.endsWith('.js')));
 
-					return locations;
-				}
-			}
-		)
-	);
+					const openDocResults = await findDefinitionInFiles(
+						openTextDocuments.map(doc => doc.uri),
+						word
+					);
 
-	// 참조 제공자 등록
-	context.subscriptions.push(
-		vscode.languages.registerReferenceProvider(
-			{ scheme: 'file', pattern: '**/*.{js,php}' },
-			{
-				async provideReferences(document: vscode.TextDocument, position: vscode.Position, context: vscode.ReferenceContext) {
-					const wordRange = document.getWordRangeAtPosition(position);
-					if (!wordRange) {
-						return [];
+					if (openDocResults.length > 0) {
+						return openDocResults;
 					}
 
-					const word = document.getText(wordRange);
-					const references: vscode.Location[] = [];
-					const files = await vscode.workspace.findFiles('**/*.php', '**/node_modules/**');
-					const processedLocations = new Set<string>();
+					// 2. 열린 문서에서 찾지 못한 경우 워크스페이스 검색
+					const files = await vscode.workspace.findFiles(
+						'{**/*.js,**/*.js.*}',
+						'{**/node_modules/**,**/dist/**,**/build/**}',
+						100 // 검색할 최대 파일 수 제한
+					);
 
-					const currentLocationKey = `${document.uri.fsPath}:${position.line}:${position.character}`;
-					processedLocations.add(currentLocationKey);
-
-					for (const file of files) {
-						try {
-							const doc = await vscode.workspace.openTextDocument(file);
-							const content = doc.getText();
-							const scriptTagRegex = /<script\b[^>]*>([\s\S]*?)<\/script>/g;
-							let match;
-
-							while ((match = scriptTagRegex.exec(content)) !== null) {
-								const scriptContent = match[1];
-								const scriptStart = doc.positionAt(match.index + match[0].indexOf(match[1]));
-								const scriptEnd = doc.positionAt(match.index + match[0].indexOf(match[1]) + match[1].length);
-
-								const refRegex = new RegExp(`(?<!['"\`])\\b${word}(?=\\.\\w+|\\s*\\()`, 'g');
-								let refMatch;
-
-								while ((refMatch = refRegex.exec(scriptContent)) !== null) {
-									const pos = doc.positionAt(match.index + match[0].indexOf(match[1]) + refMatch.index);
-									const locationKey = `${file.fsPath}:${pos.line}:${pos.character}`;
-
-									if (!processedLocations.has(locationKey) &&
-										pos.isAfterOrEqual(scriptStart) &&
-										pos.isBeforeOrEqual(scriptEnd)) {
-										processedLocations.add(locationKey);
-										references.push(new vscode.Location(file, pos));
-									}
-								}
-							}
-						} catch (error) {
-							console.error(`Failed to process file: ${file}`, error);
-						}
-					}
-
-					return references;
+					return findDefinitionInFiles(files, word);
 				}
 			}
 		)
