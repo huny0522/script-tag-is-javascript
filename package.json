@@ -2,7 +2,7 @@
   "name": "script-tag-is-javascript",
   "displayName": "Script Tag Is Javascript",
   "description": "Recognize JavaScript/TypeScript code inside PHP script tags",
-  "version": "0.0.3",
+  "version": "0.0.7",
   "publisher": "huny0522",
   "engines": {
     "vscode": "^1.93.1"

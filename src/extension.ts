@@ -1,21 +1,8 @@
 import * as vscode from 'vscode';
-
-// 파일 내용 캐시를 위한 Map
-const fileCache = new Map<string, {
-	content: string;
-	symbols: { [key: string]: vscode.Location[] };
-	lastModified: number;
-}>();
+import * as path from 'path';
 
 // 캐시 확인 및 업데이트 함수
 async function getFileSymbols(file: vscode.Uri, word: string): Promise<vscode.Location[]> {
-	const stat = await vscode.workspace.fs.stat(file);
-	const cachedData = fileCache.get(file.fsPath);
-
-	if (cachedData && cachedData.lastModified === stat.mtime) {
-		return cachedData.symbols[word] || [];
-	}
-
 	const doc = await vscode.workspace.openTextDocument(file);
 	const content = doc.getText();
 	const symbols: { [key: string]: vscode.Location[] } = {};
@@ -32,18 +19,15 @@ async function getFileSymbols(file: vscode.Uri, word: string): Promise<vscode.Lo
 			if (!symbols[symbolName]) {
 				symbols[symbolName] = [];
 			}
+			if (!Array.isArray(symbols[symbolName])) {
+				symbols[symbolName] = [];
+			}
 			const position = new vscode.Position(i, match.index);
 			symbols[symbolName].push(new vscode.Location(file, position));
 		}
 	}
 
-	fileCache.set(file.fsPath, {
-		content,
-		symbols,
-		lastModified: stat.mtime
-	});
-
-	return symbols[word] || [];
+	return Array.isArray(symbols[word]) ? symbols[word] : [];
 }
 
 async function findDefinitionInFiles(files: vscode.Uri[], word: string): Promise<vscode.Location[]> {
@@ -54,14 +38,106 @@ async function findDefinitionInFiles(files: vscode.Uri[], word: string): Promise
 		const batch = files.slice(i, i + maxConcurrent);
 		const batchResults = await Promise.all(batch.map(file => getFileSymbols(file, word)));
 		results.push(...batchResults.flat());
-
-		// 정의를 찾았다면 나머지 파일은 검색하지 않음
-		if (results.length > 0) {
-			break;
-		}
 	}
 
 	return results;
+}
+
+// Get project root directory
+function getProjectRoot(document: vscode.TextDocument): string | undefined {
+	const workspaceFolders = vscode.workspace.workspaceFolders;
+	if (!workspaceFolders) return undefined;
+
+	// Find the workspace folder that contains this document
+	const documentWorkspace = workspaceFolders.find(folder =>
+		document.uri.fsPath.startsWith(folder.uri.fsPath)
+	);
+
+	return documentWorkspace?.uri.fsPath;
+}
+
+// Extract referenced files from script tag comments
+async function getReferencedFiles(document: vscode.TextDocument): Promise<string[]> {
+	const text = document.getText();
+	const referencedFiles: string[] = [];
+	const projectRoot = getProjectRoot(document);
+
+	// Find all script tags
+	const scriptTagRegex = /<script\b[^>]*>[\s\S]*?<\/script>/g;
+	let scriptMatch;
+
+	while ((scriptMatch = scriptTagRegex.exec(text)) !== null) {
+		const scriptContent = scriptMatch[0];
+		// Look for @reffile comments - now matches multiple occurrences in both block and line comments
+		const refFileRegex = /(?:\/\*[\s\S]*?@reffile\s+([^\s\*\n]+)[\s\S]*?\*\/|\/\/\s*@reffile\s+([^\s\n]+))/g;
+		let refMatch;
+
+		while ((refMatch = refFileRegex.exec(scriptContent)) !== null) {
+			const filePath = refMatch[1] || refMatch[2];
+			if (filePath) {
+				let absolutePath: string;
+
+				if (filePath.startsWith('/')) {
+					// If path starts with /, resolve from project root
+					if (projectRoot) {
+						absolutePath = path.resolve(projectRoot, filePath.slice(1));
+					} else {
+						console.warn('Project root not found, skipping absolute path:', filePath);
+						continue;
+					}
+				} else {
+					// Relative path - resolve from document location
+					const documentDir = path.dirname(document.uri.fsPath);
+					absolutePath = path.resolve(documentDir, filePath);
+				}
+
+				// Add file if not already included
+				if (!referencedFiles.includes(absolutePath)) {
+					referencedFiles.push(absolutePath);
+					console.log('Added reference file:', absolutePath);
+				}
+			}
+		}
+
+		// Also look for multiple @reffile declarations in multiline block comments
+		const blockCommentRegex = /\/\*[\s\S]*?\*\//g;
+		let blockMatch;
+		
+		while ((blockMatch = blockCommentRegex.exec(scriptContent)) !== null) {
+			const commentContent = blockMatch[0];
+			const multiRefRegex = /@reffile\s+([^\s\*\n]+)/g;
+			let multiMatch;
+
+			while ((multiMatch = multiRefRegex.exec(commentContent)) !== null) {
+				const filePath = multiMatch[1];
+				if (filePath) {
+					let absolutePath: string;
+
+					if (filePath.startsWith('/')) {
+						// If path starts with /, resolve from project root
+						if (projectRoot) {
+							absolutePath = path.resolve(projectRoot, filePath.slice(1));
+						} else {
+							console.warn('Project root not found, skipping absolute path:', filePath);
+							continue;
+						}
+					} else {
+						// Relative path - resolve from document location
+						const documentDir = path.dirname(document.uri.fsPath);
+						absolutePath = path.resolve(documentDir, filePath);
+					}
+
+					// Add file if not already included
+					if (!referencedFiles.includes(absolutePath)) {
+						referencedFiles.push(absolutePath);
+						console.log('Added reference file:', absolutePath);
+					}
+				}
+			}
+		}
+	}
+
+	return referencedFiles;
 }
 
 export function activate(context: vscode.ExtensionContext) {
@@ -110,21 +186,8 @@ export function activate(context: vscode.ExtensionContext) {
 					const files = await vscode.workspace.findFiles('**/*.js', '**/node_modules/**');
 
 					for (const file of files) {
-						const stat = await vscode.workspace.fs.stat(file);
-						const cachedData = fileCache.get(file.fsPath);
-
-						let content: string;
-						if (cachedData && cachedData.lastModified === stat.mtime) {
-							content = cachedData.content;
-						} else {
-							const doc = await vscode.workspace.openTextDocument(file);
-							content = doc.getText();
-							fileCache.set(file.fsPath, {
-								content,
-								symbols: {},
-								lastModified: stat.mtime
-							});
-						}
+						const doc = await vscode.workspace.openTextDocument(file);
+						const content = doc.getText();
 
 						// 객체의 메소드를 찾기 위한 정규식 패턴 개선
 						const methodRegex = new RegExp(`${objectName}\\.(\\w+)\\s*=\\s*function|${objectName}\\.(\\w+)\\s*:\\s*function|${objectName}\\.(\\w+)\\s*=\\s*\\(`, 'g');
@@ -153,37 +216,29 @@ export function activate(context: vscode.ExtensionContext) {
 			[
 				{ scheme: 'file', language: 'php' },
 				{ scheme: 'file', pattern: '**/*.js' },
-				{ scheme: 'file', pattern: '**/*.js.*' }
+				{ scheme: 'file', pattern: '**/*.js.php' }
 			],
 			{
 				async provideDefinition(document: vscode.TextDocument, position: vscode.Position) {
+					console.log('provideDefinition test #1');
 					if (document.languageId === 'php' && !isInScriptTag(document, position)) {
 						return null;
 					}
+					console.log('provideDefinition test #2');
 
 					const word = document.getText(document.getWordRangeAtPosition(position));
 					if (!word) return null;
+					console.log('provideDefinition test #3');
 
-					// 1. 먼저 현재 열린 문서들에서 검색
-					const openTextDocuments = vscode.workspace.textDocuments
-						.filter(doc => doc.uri.scheme === 'file' &&
-							(doc.languageId === 'javascript' || doc.fileName.endsWith('.js')));
+					// Get referenced files from script tag comments
+					const referencedFiles = await getReferencedFiles(document);
+					if (referencedFiles.length === 0) return null;
+					console.log('provideDefinition test #4');
 
-					const openDocResults = await findDefinitionInFiles(
-						openTextDocuments.map(doc => doc.uri),
-						word
-					);
+					// Convert file paths to vscode.Uri
+					const files = referencedFiles.map(file => vscode.Uri.file(file));
+					console.log('files', files);
 
-					if (openDocResults.length > 0) {
-						return openDocResults;
-					}
-
-					// 2. 열린 문서에서 찾지 못한 경우 워크스페이스 검색
-					const files = await vscode.workspace.findFiles(
-						'{**/*.js,**/*.js.*}',
-						'{**/node_modules/**,**/dist/**,**/build/**}',
-						100 // 검색할 최대 파일 수 제한
-					);
 
 					return findDefinitionInFiles(files, word);
 				}
