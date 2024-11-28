@@ -8,11 +8,15 @@ const fileCache = new Map<string, {
 }>();
 
 // 캐시 확인 및 업데이트 함수
-async function getFileSymbols(file: vscode.Uri, word: string): Promise<vscode.Location[]> {
+async function getFileSymbols(file: vscode.Uri, word: string, objectContext?: string): Promise<vscode.Location[]> {
 	const stat = await vscode.workspace.fs.stat(file);
 	const cachedData = fileCache.get(file.fsPath);
 
 	if (cachedData && cachedData.lastModified === stat.mtime) {
+		if (objectContext) {
+			// 객체 컨텍스트가 있는 경우, 해당 객체의 메소드만 반환
+			return cachedData.symbols[`${objectContext}.${word}`] || [];
+		}
 		return cachedData.symbols[word] || [];
 	}
 
@@ -25,8 +29,9 @@ async function getFileSymbols(file: vscode.Uri, word: string): Promise<vscode.Lo
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i];
 		const symbolRegex = /(?:const|let|var|window\.)?(?:\s*)(\w+)(?:\s*=\s*[{]|\s*[=:](?:\s*function)?\s*[({])/g;
+		const methodRegex = /(\w+)\.(\w+)\s*=\s*function/g;
+		
 		let match;
-
 		while ((match = symbolRegex.exec(line)) !== null) {
 			const symbolName = match[1];
 			if (!symbols[symbolName]) {
@@ -34,6 +39,17 @@ async function getFileSymbols(file: vscode.Uri, word: string): Promise<vscode.Lo
 			}
 			const position = new vscode.Position(i, match.index);
 			symbols[symbolName].push(new vscode.Location(file, position));
+		}
+
+		// 메소드 정의 찾기
+		while ((match = methodRegex.exec(line)) !== null) {
+			const [, objectName, methodName] = match;
+			const fullName = `${objectName}.${methodName}`;
+			if (!symbols[fullName]) {
+				symbols[fullName] = [];
+			}
+			const position = new vscode.Position(i, match.index + match[0].indexOf(methodName));
+			symbols[fullName].push(new vscode.Location(file, position));
 		}
 	}
 
@@ -43,16 +59,19 @@ async function getFileSymbols(file: vscode.Uri, word: string): Promise<vscode.Lo
 		lastModified: stat.mtime
 	});
 
+	if (objectContext) {
+		return symbols[`${objectContext}.${word}`] || [];
+	}
 	return symbols[word] || [];
 }
 
-async function findDefinitionInFiles(files: vscode.Uri[], word: string): Promise<vscode.Location[]> {
+async function findDefinitionInFiles(files: vscode.Uri[], word: string, objectContext?: string): Promise<vscode.Location[]> {
 	const maxConcurrent = 5;
 	const results: vscode.Location[] = [];
 
 	for (let i = 0; i < files.length; i += maxConcurrent) {
 		const batch = files.slice(i, i + maxConcurrent);
-		const batchResults = await Promise.all(batch.map(file => getFileSymbols(file, word)));
+		const batchResults = await Promise.all(batch.map(file => getFileSymbols(file, word, objectContext)));
 		results.push(...batchResults.flat());
 
 		// 정의를 찾았다면 나머지 파일은 검색하지 않음
@@ -161,8 +180,22 @@ export function activate(context: vscode.ExtensionContext) {
 						return null;
 					}
 
-					const word = document.getText(document.getWordRangeAtPosition(position));
+					const wordRange = document.getWordRangeAtPosition(position);
+					if (!wordRange) return null;
+
+					const word = document.getText(wordRange);
 					if (!word) return null;
+
+					// 객체 컨텍스트 찾기
+					const lineText = document.lineAt(position.line).text;
+					const beforeWord = lineText.substring(0, wordRange.start.character).trim();
+					let objectContext: string | undefined;
+					
+					// 점(.) 연산자를 통한 메소드 호출 확인
+					const dotMatch = beforeWord.match(/(\w+)\.\s*$/);
+					if (dotMatch) {
+						objectContext = dotMatch[1];
+					}
 
 					// 1. 먼저 현재 열린 문서들에서 검색
 					const openTextDocuments = vscode.workspace.textDocuments
@@ -171,7 +204,8 @@ export function activate(context: vscode.ExtensionContext) {
 
 					const openDocResults = await findDefinitionInFiles(
 						openTextDocuments.map(doc => doc.uri),
-						word
+						word,
+						objectContext
 					);
 
 					if (openDocResults.length > 0) {
@@ -185,7 +219,7 @@ export function activate(context: vscode.ExtensionContext) {
 						100 // 검색할 최대 파일 수 제한
 					);
 
-					return findDefinitionInFiles(files, word);
+					return findDefinitionInFiles(files, word, objectContext);
 				}
 			}
 		)
